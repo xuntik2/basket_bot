@@ -1078,4 +1078,4 @@ async def main():
         await application.stop()
 
 if __name__ == '__main__':
-    asyncio.run(main())О
+    asyncio.run(main())
