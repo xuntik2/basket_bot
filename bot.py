@@ -2,7 +2,7 @@
 """
 Telegram Bot для учета посещаемости тренировок
 Поздравления с ДР, проф. праздники, новости баскетбола
-Версия 8.0 — Все критические ошибки исправлены
+Версия 9.0 — Retry-логика для polling, все критические ошибки исправлены
 """
 import os
 import sys
@@ -1054,21 +1054,41 @@ async def main():
     logger.info(f"Бот запущен! Время MSK: {datetime.now(MSK).strftime('%Y-%m-%d %H:%M:%S')}")
     await application.initialize()
     await application.start()
-    try:
-        await application.bot.delete_webhook(drop_pending_updates=True)
-        logger.info("Webhook удалён")
-        await application.updater.start_polling(
-            allowed_updates=Update.ALL_TYPES,
-            drop_pending_updates=True
-        )
-        logger.info("Polling запущен успешно")
-    except Conflict as e:
-        logger.error(f"Конфликт polling: {e}")
-        await asyncio.sleep(5)
-        raise
-    except Exception as e:
-        logger.error(f"Ошибка запуска polling: {e}")
-        raise
+    
+    # === RETRY-ЛОГИКА ДЛЯ POLLING (Render) ===
+    max_retries = 3
+    retry_delay = 30
+    
+    for attempt in range(max_retries):
+        try:
+            # Гарантированно удаляем webhook
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Webhook удалён")
+            
+            # Даём время старому процессу завершиться (Render rolling deploy)
+            await asyncio.sleep(5)
+            
+            # Запускаем polling с игнорированием старых сообщений
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True
+            )
+            logger.info("Polling запущен успешно")
+            break  # Успех — выходим из цикла
+            
+        except Conflict as e:
+            if attempt < max_retries - 1:
+                logger.warning(f"Conflict (попытка {attempt + 1}/{max_retries}). Ждем {retry_delay} сек...")
+                await asyncio.sleep(retry_delay)
+            else:
+                logger.error(f"Не удалось запустить polling после {max_retries} попыток")
+                raise  # Перезапуск контейнера Render
+                
+        except Exception as e:
+            logger.error(f"Ошибка запуска polling: {e}", exc_info=True)
+            raise
+    # ===========================================
+    
     try:
         while True:
             await asyncio.sleep(1)
