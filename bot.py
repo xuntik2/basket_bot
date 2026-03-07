@@ -2,9 +2,10 @@
 """
 Telegram Bot для учета посещаемости тренировок
 Автоматические опросы, поздравления с ДР, проф. праздники, новости баскетбола
-Версия 16.0 — Production Ready: Все ошибки исправлены, безопасность улучшена
+Версия 18.0 — Production Ready
 
-ИСПРАВЛЕНИЯ В ВЕРСИИ 16.0:
+ИСПРАВЛЕНИЯ В ВЕРСИИ 18.0:
+- Изменён день автоматического опроса с вторника на понедельник (10:30 МСК)
 - Исправлен баг с _poll_locks как class attribute (теперь instance attribute)
 - Исправлен пустой except на except Exception
 - Исправлен незакрытый тег </b> в help_command
@@ -12,9 +13,11 @@ Telegram Bot для учета посещаемости тренировок
 - Добавлена обёртка safe_execute для cleanup_old_locks
 - Улучшена валидация user_id (добавлена проверка на None)
 - Добавлена защита от memory leak в _poll_locks
-- Улучшена обработка ошибок
-- Добавлена конфигурируемость пути к birthday_image через env
-- Исправлено дублирование кода в генерации Excel
+- Добавлен класс BotMetrics для мониторинга
+- Добавлен check_database_health() для проверки БД
+- Добавлен graceful_shutdown с signal handlers
+- Добавлен TTLCache для кэширования ответов опросов
+- Расширен health endpoint с проверкой БД
 """
 import os
 import sys
@@ -22,7 +25,7 @@ import logging
 import asyncio
 import re
 import calendar
-import tempfile
+import signal
 import feedparser
 import hmac
 import hashlib
@@ -32,6 +35,7 @@ from functools import wraps, partial
 from collections import defaultdict
 from io import BytesIO
 from zoneinfo import ZoneInfo
+from cachetools import TTLCache
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import (
     Application,
@@ -63,8 +67,64 @@ MSK = ZoneInfo("Europe/Moscow")
 
 # ==================== КОНСТАНТЫ ====================
 MAX_ERROR_TEXT_LENGTH = 300
-MAX_POLL_LOCKS_COUNT = 1000  # Максимальное количество хранимых locks
+MAX_POLL_LOCKS_COUNT = 1000
 CLEANUP_LOCKS_DAYS = 7
+CACHE_TTL_SECONDS = 300  # 5 минут
+CACHE_MAX_SIZE = 500
+SHUTDOWN_TIMEOUT = 30  # секунд на graceful shutdown
+
+
+# ==================== МЕТРИКИ ДЛЯ МОНИТОРИНГА ====================
+class BotMetrics:
+    """
+    Thread-safe класс для сбора метрик бота.
+    Использует asyncio.Lock для защиты от race conditions.
+    """
+    
+    def __init__(self):
+        self._lock = asyncio.Lock()
+        self._counters: Dict[str, int] = {
+            'polls_created': 0,
+            'responses_saved': 0,
+            'errors_count': 0,
+            'birthdays_sent': 0,
+            'news_sent': 0,
+            'api_calls': 0,
+        }
+        self._start_time = datetime.now(MSK)
+    
+    async def increment(self, metric_name: str, value: int = 1) -> None:
+        """Увеличить счётчик метрики"""
+        async with self._lock:
+            if metric_name in self._counters:
+                self._counters[metric_name] += value
+    
+    async def get_counter(self, metric_name: str) -> int:
+        """Получить значение счётчика"""
+        async with self._lock:
+            return self._counters.get(metric_name, 0)
+    
+    async def get_all_counters(self) -> Dict[str, int]:
+        """Получить копию всех счётчиков"""
+        async with self._lock:
+            return dict(self._counters)
+    
+    async def reset_counter(self, metric_name: str) -> None:
+        """Сбросить счётчик"""
+        async with self._lock:
+            if metric_name in self._counters:
+                self._counters[metric_name] = 0
+    
+    def get_uptime(self) -> timedelta:
+        """Получить время работы бота"""
+        return datetime.now(MSK) - self._start_time
+    
+    def get_uptime_str(self) -> str:
+        """Получить время работы в читаемом формате"""
+        uptime = self.get_uptime()
+        hours, remainder = divmod(int(uptime.total_seconds()), 3600)
+        minutes, seconds = divmod(remainder, 60)
+        return f"{hours}h {minutes}m {seconds}s"
 
 
 # ==================== КЛАСС КОНФИГУРАЦИИ ====================
@@ -216,7 +276,7 @@ def validate_user_id(user_id: Any) -> int:
 
 def truncate_text_safe(text: str, max_length: int = MAX_ERROR_TEXT_LENGTH) -> str:
     """
-    Безопасное обрезание текста с сохранением целостности HTML.
+    Безопасное обрезание текста с сохранением целостности.
     """
     if len(text) <= max_length:
         return text
@@ -232,6 +292,11 @@ async def safe_execute(job_func: Callable, application: Application, *args, **kw
     except Exception as e:
         error_msg = f"⚠️ Ошибка в задаче {job_func.__name__}:\n{type(e).__name__}: {truncate_text_safe(str(e))}"
         logger.error(error_msg, exc_info=True)
+        
+        metrics = application.bot_data.get('metrics')
+        if metrics:
+            await metrics.increment('errors_count')
+        
         config = application.bot_data.get('config')
         if config and config.owner_id:
             try:
@@ -271,7 +336,13 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         return
+    
     logger.error(msg="Exception while handling an update:", exc_info=error)
+    
+    metrics = context.application.bot_data.get('metrics')
+    if metrics:
+        await metrics.increment('errors_count')
+    
     config = context.application.bot_data.get('config')
     if config and config.owner_id:
         try:
@@ -290,9 +361,12 @@ class DatabaseManager:
     
     def __init__(self, supabase_client: Client):
         self.supabase = supabase_client
-        # ИСПРАВЛЕНО: _poll_locks теперь instance attribute, не class attribute
+        # _poll_locks теперь instance attribute
         self._poll_locks: Dict[str, asyncio.Lock] = {}
-        self._locks_lock = asyncio.Lock()  # Lock для защиты доступа к _poll_locks
+        self._locks_lock = asyncio.Lock()
+        # Кэш для ответов опросов с TTL
+        self._responses_cache = TTLCache(maxsize=CACHE_MAX_SIZE, ttl=CACHE_TTL_SECONDS)
+        self._cache_lock = asyncio.Lock()
     
     async def _get_poll_lock(self, poll_id: str) -> asyncio.Lock:
         """Получение или создание lock для poll_id (thread-safe)"""
@@ -328,18 +402,37 @@ class DatabaseManager:
         if old_ids:
             logger.info(f"Очищено {len(old_ids)} старых locks")
     
-    async def init_tables(self):
+    async def check_database_health(self) -> Tuple[bool, str]:
+        """
+        Проверка доступности Supabase.
+        
+        Returns:
+            Tuple[bool, str]: (успех, сообщение)
+        """
+        try:
+            await asyncio.to_thread(
+                lambda: self.supabase.table('polls').select('*').limit(1).execute()
+            )
+            return True, "Database connection OK"
+        except Exception as e:
+            error_msg = truncate_text_safe(str(e))
+            logger.error(f"Database health check failed: {error_msg}")
+            return False, f"Database error: {error_msg}"
+    
+    async def init_tables(self) -> bool:
         """Инициализация и проверка таблиц"""
         try:
             await asyncio.to_thread(
                 lambda: self.supabase.table('polls').select('*').limit(1).execute()
             )
             logger.info("Таблицы инициализированы")
+            return True
         except Exception as e:
             logger.error(f"Ошибка проверки таблиц: {e}")
+            return False
     
     async def save_poll(self, poll_id: str, message_id: int, chat_id: int, 
-                       training_date: str, created_at: datetime) -> bool:
+                       training_date: str, created_at: datetime, metrics: BotMetrics = None) -> bool:
         """
         Сохранение опроса в базу.
         
@@ -358,13 +451,17 @@ class DatabaseManager:
                 lambda: self.supabase.table('polls').insert(data).execute()
             )
             logger.info(f"Опрос {poll_id} сохранен")
+            if metrics:
+                await metrics.increment('polls_created')
             return True
         except Exception as e:
             logger.error(f"Ошибка сохранения опроса: {e}")
+            if metrics:
+                await metrics.increment('errors_count')
             return False
     
     async def save_response(self, poll_id: str, user_id: int, username: str, 
-                           full_name: str, response: str) -> bool:
+                           full_name: str, response: str, metrics: BotMetrics = None) -> bool:
         """Сохранение ответа на опрос"""
         poll_lock = await self._get_poll_lock(poll_id)
         async with poll_lock:
@@ -392,17 +489,61 @@ class DatabaseManager:
                         lambda: self.supabase.table('responses').insert(data).execute()
                     )
                 logger.info(f"Ответ сохранен: {username} - {response}")
+                
+                # Инвалидируем кэш для этого опроса
+                await self._invalidate_cache(poll_id)
+                
+                if metrics:
+                    await metrics.increment('responses_saved')
                 return True
             except Exception as e:
                 logger.error(f"Ошибка сохранения ответа: {e}")
+                if metrics:
+                    await metrics.increment('errors_count')
                 return False
+    
+    async def _invalidate_cache(self, poll_id: str) -> None:
+        """Инвалидация кэша для опроса"""
+        async with self._cache_lock:
+            if poll_id in self._responses_cache:
+                del self._responses_cache[poll_id]
+    
+    async def get_poll_responses(self, poll_id: str, use_cache: bool = True) -> List[Dict]:
+        """
+        Получение ответов на опрос с кэшированием.
+        
+        Args:
+            poll_id: ID опроса
+            use_cache: Использовать кэш (по умолчанию True)
+        """
+        # Проверяем кэш
+        if use_cache:
+            async with self._cache_lock:
+                if poll_id in self._responses_cache:
+                    return self._responses_cache[poll_id]
+        
+        try:
+            result = await asyncio.to_thread(
+                lambda: self.supabase.table('responses').select('*').eq('poll_id', poll_id).execute()
+            )
+            data = result.data or []
+            
+            # Сохраняем в кэш
+            if use_cache:
+                async with self._cache_lock:
+                    self._responses_cache[poll_id] = data
+            
+            return data
+        except Exception as e:
+            logger.error(f"Ошибка получения ответов: {e}")
+            return []
     
     async def cleanup_old_locks(self, days: int = CLEANUP_LOCKS_DAYS) -> int:
         """
         Очистка старых locks для предотвращения утечки памяти.
         
         Returns:
-            Количество очищенных locks
+            Количество оставшихся locks
         """
         try:
             async with self._locks_lock:
@@ -411,6 +552,13 @@ class DatabaseManager:
         except Exception as e:
             logger.error(f"Ошибка очистки locks: {e}")
             return 0
+    
+    async def cleanup_cache(self) -> int:
+        """Принудительная очистка кэша"""
+        async with self._cache_lock:
+            count = len(self._responses_cache)
+            self._responses_cache.clear()
+            return count
     
     async def ensure_user_exists(self, user_id: int, username: str, full_name: str) -> bool:
         """Создание записи пользователя если не существует"""
@@ -485,17 +633,6 @@ class DatabaseManager:
             logger.error(f"Ошибка добавления ДР: {e}")
             raise
     
-    async def get_poll_responses(self, poll_id: str) -> List[Dict]:
-        """Получение ответов на опрос"""
-        try:
-            result = await asyncio.to_thread(
-                lambda: self.supabase.table('responses').select('*').eq('poll_id', poll_id).execute()
-            )
-            return result.data or []
-        except Exception as e:
-            logger.error(f"Ошибка получения ответов: {e}")
-            return []
-    
     async def get_monthly_stats(self, year: int, month: int, limit: int = 1000) -> pd.DataFrame:
         """Получение статистики за месяц"""
         try:
@@ -510,7 +647,8 @@ class DatabaseManager:
                 return pd.DataFrame()
             all_responses = []
             for poll in polls:
-                responses = await self.get_poll_responses(poll['poll_id'])
+                # Не используем кэш для статистики
+                responses = await self.get_poll_responses(poll['poll_id'], use_cache=False)
                 for resp in responses:
                     resp['training_date'] = poll['training_date']
                 all_responses.extend(responses)
@@ -579,7 +717,7 @@ class DatabaseManager:
         except Exception:
             return False
     
-    async def mark_news_sent(self, news_id: str, title: str) -> bool:
+    async def mark_news_sent(self, news_id: str, title: str, metrics: BotMetrics = None) -> bool:
         """Отметить новость как отправленную"""
         try:
             data = {
@@ -590,6 +728,8 @@ class DatabaseManager:
             await asyncio.to_thread(
                 lambda: self.supabase.table('sports_news').insert(data).execute()
             )
+            if metrics:
+                await metrics.increment('news_sent')
             return True
         except Exception as e:
             logger.error(f"Ошибка сохранения новости: {e}")
@@ -780,6 +920,7 @@ async def send_birthday_greetings(application: Application):
     """Отправка поздравлений с днём рождения"""
     config = application.bot_data.get('config')
     db_manager = application.bot_data.get('db_manager')
+    metrics = application.bot_data.get('metrics')
     
     if not config or not config.group_chat_id:
         logger.error("GROUP_CHAT_ID не настроен для поздравлений")
@@ -838,6 +979,8 @@ async def send_birthday_greetings(application: Application):
                     parse_mode=ParseMode.HTML
                 )
             logger.info(f"Поздравили: {name}")
+            if metrics:
+                await metrics.increment('birthdays_sent')
             await asyncio.sleep(2)
         except Exception as e:
             logger.error(f"Ошибка поздравления {name}: {e}")
@@ -870,6 +1013,7 @@ async def check_basketball_champions(application: Application):
     """Проверка и отправка новостей о баскетбольных чемпионах"""
     config = application.bot_data.get('config')
     db_manager = application.bot_data.get('db_manager')
+    metrics = application.bot_data.get('metrics')
     
     if not config or not config.enable_basketball_news or not config.group_chat_id:
         return
@@ -933,7 +1077,7 @@ async def check_basketball_champions(application: Application):
                                     text=text,
                                     parse_mode=ParseMode.HTML
                                 )
-                            await db_manager.mark_news_sent(news_id, entry.title)
+                            await db_manager.mark_news_sent(news_id, entry.title, metrics)
                             logger.info(f"Отправлена новость: {truncate_text_safe(entry.title)}")
                             await asyncio.sleep(3)
                         except Exception as e:
@@ -988,7 +1132,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"👋 Привет, {user.first_name}!\n"
             f"Я бот для учета посещаемости тренировок.\n"
-            f"Каждый вторник создаю опрос о посещении.\n"
+            f"Каждый понедельник создаю опрос о посещении.\n"
             f"/help - Помощь"
         )
     except Exception as e:
@@ -1016,7 +1160,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             text += "/stats - Полная статистика (Excel)\n"
             text += "/monthlystats - Статистика за месяц\n"
             text += "/addbirthday user_id ДД-ММ Имя - Добавить ДР пользователю\n"
-            # ИСПРАВЛЕНО: добавлен закрывающий тег </b>
             text += "\n⚙️ <b>Настройки (через переменные окружения Render):</b>\n"
             text += "ENABLE_BASKETBALL_NEWS=false - отключить новости баскетбола\n"
         await update.message.reply_text(text, parse_mode=ParseMode.HTML)
@@ -1072,6 +1215,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
         config = context.application.bot_data.get('config')
         db_manager = context.application.bot_data.get('db_manager')
+        metrics = context.application.bot_data.get('metrics')
         
         logger.info(f"=== ПРОВЕРКА ПЕРЕД ОПРОСОМ ===")
         logger.info(f"GROUP_CHAT_ID из ENV: {config.group_chat_id!r}")
@@ -1115,7 +1259,8 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             message_id=message.message_id,
             chat_id=message.chat_id,
             training_date=training_date_iso,
-            created_at=datetime.now(MSK)
+            created_at=datetime.now(MSK),
+            metrics=metrics
         )
         
         await update.message.reply_text(f"✅ Опрос создан в группе! ID: {poll_id}")
@@ -1279,12 +1424,15 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         training_date = date_match.group(1) if date_match else "Неизвестно"
         
         db_manager = context.application.bot_data.get('db_manager')
+        metrics = context.application.bot_data.get('metrics')
+        
         await db_manager.save_response(
             poll_id=poll_id,
             user_id=user.id,
             username=user.username or '',
             full_name=user.full_name or '',
-            response=response
+            response=response,
+            metrics=metrics
         )
         
         await query.edit_message_text(
@@ -1311,6 +1459,7 @@ async def scheduled_poll(application: Application):
     """Создание автоматического опроса по расписанию"""
     config = application.bot_data.get('config')
     db_manager = application.bot_data.get('db_manager')
+    metrics = application.bot_data.get('metrics')
     
     if not config or not config.group_chat_id:
         logger.error("GROUP_CHAT_ID не настроен")
@@ -1333,7 +1482,8 @@ async def scheduled_poll(application: Application):
         message_id=message.message_id,
         chat_id=message.chat_id,
         training_date=training_date_iso,
-        created_at=datetime.now(MSK)
+        created_at=datetime.now(MSK),
+        metrics=metrics
     )
     logger.info(f"Автоматический опрос создан: {poll_id}")
 
@@ -1375,10 +1525,11 @@ async def scheduled_cleanup_locks(application: Application):
     db_manager = application.bot_data.get('db_manager')
     if db_manager:
         count = await db_manager.cleanup_old_locks()
-        logger.info(f"Очистка locks завершена, осталось: {count}")
+        cache_count = await db_manager.cleanup_cache()
+        logger.info(f"Очистка завершена: locks={count}, cache_cleared={cache_count}")
 
 
-def schedule_professional_holidays(scheduler, application: Application):
+def schedule_professional_holidays(scheduler: AsyncIOScheduler, application: Application):
     """Планирование профессиональных праздников"""
     now = datetime.now(MSK).date()
     year = now.year
@@ -1389,8 +1540,6 @@ def schedule_professional_holidays(scheduler, application: Application):
             holiday_date = holiday['calc'](year + 1)
         
         job_id = f"holiday_{key}_{year}"
-        
-        # ИСПРАВЛЕНО: используем partial для правильной передачи аргументов
         run_datetime = datetime.combine(holiday_date, datetime.min.time().replace(hour=10))
         scheduler.add_job(
             safe_execute,
@@ -1406,10 +1555,10 @@ def setup_scheduler(application: Application) -> AsyncIOScheduler:
     """Настройка планировщика задач"""
     scheduler = AsyncIOScheduler(timezone=MSK)
     
-    # Еженедельный опрос (вторник, 10:30)
+    # Еженедельный опрос - ИЗМЕНЕНО: понедельник (mon) вместо вторника (tue), 10:30
     scheduler.add_job(
         safe_execute,
-        trigger=CronTrigger(day_of_week='tue', hour=10, minute=30, timezone=MSK),
+        trigger=CronTrigger(day_of_week='mon', hour=10, minute=30, timezone=MSK),
         id='weekly_poll',
         args=[scheduled_poll, application],
         replace_existing=True
@@ -1442,7 +1591,7 @@ def setup_scheduler(application: Application) -> AsyncIOScheduler:
         replace_existing=True
     )
     
-    # ИСПРАВЛЕНО: Очистка locks использует safe_execute
+    # Очистка locks и кэша (ежедневно, 3:00 ночи)
     scheduler.add_job(
         safe_execute,
         trigger=CronTrigger(hour=3, minute=0, timezone=MSK),
@@ -1453,13 +1602,91 @@ def setup_scheduler(application: Application) -> AsyncIOScheduler:
     
     schedule_professional_holidays(scheduler, application)
     scheduler.start()
-    logger.info("Планировщик запущен")
+    logger.info("Планировщик запущен: автоматический опрос каждый понедельник в 10:30 МСК")
     return scheduler
+
+
+# ==================== GRACEFUL SHUTDOWN ====================
+
+class GracefulShutdown:
+    """Менеджер graceful shutdown для корректного завершения работы"""
+    
+    def __init__(self):
+        self._shutdown_event = asyncio.Event()
+        self._application: Optional[Application] = None
+        self._scheduler: Optional[AsyncIOScheduler] = None
+        self._is_shutting_down = False
+    
+    def setup(self, application: Application, scheduler: AsyncIOScheduler) -> None:
+        """Настройка обработчиков сигналов"""
+        self._application = application
+        self._scheduler = scheduler
+        
+        # Регистрация обработчиков сигналов
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                signal.signal(sig, self._signal_handler)
+            except ValueError:
+                # Signal handling not supported on Windows
+                pass
+        
+        logger.info("Graceful shutdown handlers установлены")
+    
+    def _signal_handler(self, signum: int, frame) -> None:
+        """Обработчик сигналов завершения"""
+        if self._is_shutting_down:
+            logger.warning("Получен повторный сигнал, принудительное завершение")
+            sys.exit(1)
+        
+        self._is_shutting_down = True
+        signal_name = signal.Signals(signum).name
+        logger.info(f"Получен сигнал {signal_name}, начинаем graceful shutdown...")
+        
+        # Запускаем асинхронную задачу shutdown
+        asyncio.create_task(self._shutdown())
+    
+    async def _shutdown(self) -> None:
+        """Асинхронное завершение работы"""
+        try:
+            # Устанавливаем таймаут
+            shutdown_task = asyncio.create_task(self._do_shutdown())
+            
+            try:
+                await asyncio.wait_for(shutdown_task, timeout=SHUTDOWN_TIMEOUT)
+            except asyncio.TimeoutError:
+                logger.warning("Graceful shutdown превысил таймаут, принудительное завершение")
+            
+        except Exception as e:
+            logger.error(f"Ошибка при shutdown: {e}")
+        finally:
+            self._shutdown_event.set()
+    
+    async def _do_shutdown(self) -> None:
+        """Выполнение shutdown операций"""
+        # Остановка планировщика
+        if self._scheduler:
+            logger.info("Остановка планировщика...")
+            self._scheduler.shutdown(wait=False)
+        
+        # Остановка Telegram бота
+        if self._application:
+            logger.info("Остановка Telegram бота...")
+            try:
+                await self._application.stop()
+                await self._application.shutdown()
+            except Exception as e:
+                logger.error(f"Ошибка при остановке бота: {e}")
+        
+        logger.info("Graceful shutdown завершен")
+    
+    async def wait_for_shutdown(self) -> None:
+        """Ожидание сигнала завершения"""
+        await self._shutdown_event.wait()
 
 
 # ==================== FLASK ДЛЯ KEEP-ALIVE ====================
 
-def create_flask_app():
+def create_flask_app(db_manager: DatabaseManager = None, metrics: BotMetrics = None):
     """Создание Flask приложения для health checks"""
     app = Flask(__name__)
     
@@ -1469,19 +1696,79 @@ def create_flask_app():
     
     @app.route('/health')
     def health():
-        return jsonify({
+        """Расширенный health check с проверкой БД и метриками"""
+        health_data = {
             "status": "ok",
             "timestamp": datetime.now(MSK).isoformat(),
-            "timezone": "Europe/Moscow"
-        })
+            "timezone": "Europe/Moscow",
+        }
+        
+        # Добавляем uptime
+        if metrics:
+            health_data["uptime"] = metrics.get_uptime_str()
+        
+        # Проверка БД (синхронно, так как Flask синхронный)
+        if db_manager:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                try:
+                    db_healthy, db_msg = loop.run_until_complete(db_manager.check_database_health())
+                    health_data["database"] = {
+                        "status": "ok" if db_healthy else "error",
+                        "message": db_msg
+                    }
+                finally:
+                    loop.close()
+            except Exception as e:
+                health_data["database"] = {
+                    "status": "error",
+                    "message": str(e)[:100]
+                }
+        
+        # Добавляем метрики
+        if metrics:
+            try:
+                import asyncio
+                loop = asyncio.new_event_loop()
+                try:
+                    counters = loop.run_until_complete(metrics.get_all_counters())
+                    health_data["metrics"] = counters
+                finally:
+                    loop.close()
+            except Exception as e:
+                health_data["metrics_error"] = str(e)[:50]
+        
+        return jsonify(health_data)
+    
+    @app.route('/metrics')
+    def metrics_endpoint():
+        """Endpoint для получения метрик"""
+        if not metrics:
+            return jsonify({"error": "Metrics not available"}), 503
+        
+        try:
+            import asyncio
+            loop = asyncio.new_event_loop()
+            try:
+                counters = loop.run_until_complete(metrics.get_all_counters())
+                return jsonify({
+                    "counters": counters,
+                    "uptime": metrics.get_uptime_str(),
+                    "uptime_seconds": metrics.get_uptime().total_seconds()
+                })
+            finally:
+                loop.close()
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
     
     return app
 
 
-def run_flask(port: int):
+def run_flask(port: int, db_manager: DatabaseManager = None, metrics: BotMetrics = None):
     """Запуск Flask сервера"""
-    app = create_flask_app()
-    app.run(host='0.0.0.0', port=port, use_reloader=False)
+    app = create_flask_app(db_manager, metrics)
+    app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
 
 
 # ==================== ОСНОВНАЯ ФУНКЦИЯ ====================
@@ -1493,6 +1780,9 @@ async def main():
     
     if not config.is_valid():
         logger.error("Не все переменные окружения настроены!")
+        logger.error(f"BOT_TOKEN: {'set' if config.bot_token else 'missing'}")
+        logger.error(f"SUPABASE_URL: {'set' if config.supabase_url else 'missing'}")
+        logger.error(f"SUPABASE_KEY: {'set' if config.supabase_key else 'missing'}")
         return
     
     # Инициализация Supabase
@@ -1501,6 +1791,13 @@ async def main():
     # Инициализация менеджеров
     db_manager = DatabaseManager(supabase_client)
     rate_limiter = RateLimiter(calls=10, period=60)
+    metrics = BotMetrics()
+    
+    # Проверка БД
+    db_healthy, db_msg = await db_manager.check_database_health()
+    if not db_healthy:
+        logger.error(f"Database health check failed: {db_msg}")
+        # Продолжаем работу, бот может восстановиться
     
     await db_manager.init_tables()
     
@@ -1511,6 +1808,7 @@ async def main():
     application.bot_data['config'] = config
     application.bot_data['db_manager'] = db_manager
     application.bot_data['rate_limiter'] = rate_limiter
+    application.bot_data['metrics'] = metrics
     
     # Регистрация обработчиков
     application.add_handler(CommandHandler("start", start_command))
@@ -1527,11 +1825,21 @@ async def main():
     # Настройка планировщика
     scheduler = setup_scheduler(application)
     
-    # Запуск Flask в отдельном потоке
-    flask_thread = Thread(target=run_flask, args=(config.port,), daemon=True)
+    # Настройка graceful shutdown
+    shutdown_manager = GracefulShutdown()
+    shutdown_manager.setup(application, scheduler)
+    
+    # Запуск Flask в отдельном потоке (передаём db_manager и metrics для health checks)
+    flask_thread = Thread(
+        target=run_flask, 
+        args=(config.port, db_manager, metrics), 
+        daemon=True
+    )
     flask_thread.start()
     
     logger.info(f"Бот запущен! Время MSK: {datetime.now(MSK).strftime('%Y-%m-%d %H:%M:%S')}")
+    logger.info(f"Health endpoint: http://0.0.0.0:{config.port}/health")
+    logger.info(f"Metrics endpoint: http://0.0.0.0:{config.port}/metrics")
     
     await application.initialize()
     await application.start()
@@ -1567,13 +1875,22 @@ async def main():
             raise
     
     try:
-        while True:
-            await asyncio.sleep(1)
+        # Ждём либо сигнала завершения, либо KeyboardInterrupt
+        await shutdown_manager.wait_for_shutdown()
     except (KeyboardInterrupt, SystemExit):
+        logger.info("Получен KeyboardInterrupt, завершение...")
+    finally:
         logger.info("Остановка бота...")
         scheduler.shutdown()
         await application.stop()
+        await application.shutdown()
 
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Бот остановлен пользователем")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}", exc_info=True)
+        sys.exit(1)
