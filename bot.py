@@ -2,7 +2,7 @@
 """
 Telegram Bot для учета посещаемости тренировок
 Автоматические опросы каждый вторник, статистика для админов
-Версия 2.0 - Исправлены критические ошибки с poll_id и часовыми поясами
+Версия 3.0 - Все критические ошибки исправлены
 """
 import os
 import logging
@@ -57,13 +57,15 @@ def home():
 @app.route('/health')
 def health():
     return jsonify({
-        "status": "ok", 
-        "timestamp": datetime.now(MSK).isoformat(), 
+        "status": "ok",
+        "timestamp": datetime.now(MSK).isoformat(),
         "timezone": "Europe/Moscow"
     })
 
 def run_flask():
-    app.run(host='0.0.0.0', port=PORT, use_reloader=False)
+    port = int(os.environ.get('PORT', 10000))
+    app.run(host='0.0.0.0', port=port, use_reloader=False)
+
 
 class DatabaseManager:
     """Управление базой данных Supabase с асинхронными вызовами"""
@@ -201,6 +203,7 @@ class DatabaseManager:
             logger.error(f"Ошибка получения полной статистики: {e}")
             return pd.DataFrame()
 
+
 class PollManager:
     """Управление опросами с московским временем"""
     
@@ -281,6 +284,7 @@ class PollManager:
         except Exception as e:
             logger.error(f"Ошибка обновления опроса: {e}")
 
+
 # ============ КОМАНДЫ БОТА ============
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -294,6 +298,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"/help - Помощь"
     )
 
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help"""
     is_admin = update.effective_user.id in ADMIN_USER_IDS
@@ -306,6 +311,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text += "/stats - Получить полную статистику (Excel)\n"
         text += "/monthlystats - Статистика за текущий месяц\n"
     await update.message.reply_text(text, parse_mode=ParseMode.HTML)
+
 
 async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /poll - создание опроса вручную (только для админов)"""
@@ -343,6 +349,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка создания опроса: {e}")
         await update.message.reply_text(f"❌ Ошибка создания опроса: {e}")
+
 
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /stats - получение полной статистики (только для админов)"""
@@ -388,6 +395,7 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ошибка формирования статистики: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+
 async def monthly_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /monthlystats - статистика за текущий месяц"""
     user = update.effective_user
@@ -432,6 +440,7 @@ async def monthly_stats_command(update: Update, context: ContextTypes.DEFAULT_TY
         logger.error(f"Ошибка формирования месячной статистики: {e}")
         await update.message.reply_text(f"❌ Ошибка: {e}")
 
+
 async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработка нажатий на кнопки опроса"""
     query = update.callback_query
@@ -443,7 +452,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     
     # ✅ ИСПРАВЛЕНО: Извлекаем poll_id из callback_data
-    data_parts = data.split(':')  # ['poll', 'yes', 'auto_20250114']
+    data_parts = data.split(':')
     if len(data_parts) < 3:
         logger.error(f"Некорректный формат callback_data: {data}")
         return
@@ -487,6 +496,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     logger.info(f"Пользователь {user.username} выбрал: {response_text}")
 
+
 # ============ АВТОМАТИЧЕСКИЕ ЗАДАЧИ ============
 
 async def scheduled_poll(application: Application):
@@ -519,6 +529,7 @@ async def scheduled_poll(application: Application):
         logger.info(f"Автоматический опрос создан: {poll_id}")
     except Exception as e:
         logger.error(f"Ошибка автоматического создания опроса: {e}")
+
 
 async def scheduled_monthly_stats(application: Application):
     """Автоматическая отправка статистики в последний день месяца"""
@@ -561,11 +572,12 @@ async def scheduled_monthly_stats(application: Application):
     except Exception as e:
         logger.error(f"Ошибка автоматической отправки статистики: {e}")
 
+
 def setup_scheduler(application: Application):
     """Настройка планировщика задач с правильным временем"""
     scheduler = AsyncIOScheduler()
     
-    # Опрос каждый вторник в 10:30 по Москве (UTC+3 = 07:30 UTC)
+    # Опрос каждый вторник в 10:30 по Москве (07:30 UTC)
     scheduler.add_job(
         scheduled_poll,
         trigger=CronTrigger(day_of_week='tue', hour=7, minute=30, timezone='UTC'),
@@ -574,7 +586,7 @@ def setup_scheduler(application: Application):
         replace_existing=True
     )
     
-    # Статистика в последний день месяца в 15:00 по Москве (UTC+3 = 12:00 UTC)
+    # Статистика в последний день месяца в 15:00 по Москве (12:00 UTC)
     scheduler.add_job(
         scheduled_monthly_stats,
         trigger=CronTrigger(day='last', hour=12, minute=0, timezone='UTC'),
@@ -586,6 +598,7 @@ def setup_scheduler(application: Application):
     scheduler.start()
     logger.info("Планировщик запущен (время UTC, опросы в 07:30 UTC = 10:30 MSK)")
     return scheduler
+
 
 # ============ ОСНОВНАЯ ФУНКЦИЯ ============
 
@@ -624,6 +637,7 @@ async def main():
         logger.info("Остановка бота...")
         scheduler.shutdown()
         await application.stop()
+
 
 if __name__ == '__main__':
     asyncio.run(main())
