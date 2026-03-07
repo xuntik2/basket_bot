@@ -2,7 +2,7 @@
 """
 Telegram Bot для учета посещаемости тренировок
 Поздравления с ДР, проф. праздники, новости баскетбола
-Версия 8.0 — Все критические ошибки исправлены, все рекомендации учтены
+Версия 8.0 — Все критические ошибки исправлены
 """
 import os
 import sys
@@ -244,7 +244,6 @@ class DatabaseManager:
     async def add_or_update_birthday(user_id: int, full_name: str, birth_date: str, username: str = ''):
         """Добавление/обновление ДР с корректной валидацией"""
         try:
-            # Валидация даты (проверка на реальность)
             if birth_date:
                 try:
                     datetime.strptime(birth_date, "%d-%m")
@@ -458,11 +457,8 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         old_status = member.old_chat_member.status if member.old_chat_member else None
         new_status = member.status
         
-        # Новый участник присоединился
         if new_status in ['member', 'administrator'] and old_status not in ['member', 'administrator']:
             await welcome_new_member(update, context, user)
-        
-        # Участник покинул чат
         elif new_status in ['left', 'kicked']:
             await DatabaseManager.mark_user_inactive(user.id)
             logger.info(f"Участник покинул чат: {user.id}")
@@ -491,7 +487,6 @@ async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE,
             parse_mode=ParseMode.HTML
         )
         
-        # Сохраняем пользователя (без ДР — только вручную или через /setbirthday)
         await DatabaseManager.ensure_user_exists(
             user_id=user.id,
             username=user.username or '',
@@ -594,7 +589,6 @@ async def check_basketball_champions(application: Application):
     
     try:
         rss_url = "https://www.sports.ru/rss/topic.xml"
-        # ✅ Асинхронный вызов feedparser
         feed = await asyncio.to_thread(feedparser.parse, rss_url)
         
         if not feed.entries:
@@ -615,14 +609,12 @@ async def check_basketball_champions(application: Application):
                 published = datetime(*entry.published_parsed[:6]).date()
             
             if published and published == yesterday:
-                # ✅ Проверка и в заголовке, и в описании
                 title_lower = entry.title.lower()
                 summary_lower = entry.get('summary', '').lower()
                 combined_text = title_lower + ' ' + summary_lower
                 
                 for league, keywords in leagues.items():
                     if any(kw in combined_text for kw in keywords):
-                        # ✅ Используем entry.id если есть, иначе составной ключ
                         news_id = entry.get('id', f"{league}_{published}_{entry.title[:50]}")
                         
                         if await DatabaseManager.check_news_sent(news_id):
@@ -1054,9 +1046,7 @@ async def main():
     application.add_handler(CommandHandler("addbirthday", add_birthday_command))
     application.add_handler(CommandHandler("setbirthday", set_birthday_command))
     application.add_handler(CallbackQueryHandler(poll_callback, pattern='^poll:'))
-    # ✅ Единый обработчик входа/выхода
     application.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER))
-    # ✅ Глобальный обработчик ошибок
     application.add_error_handler(error_handler)
     scheduler = setup_scheduler(application)
     flask_thread = Thread(target=run_flask, daemon=True)
@@ -1064,7 +1054,6 @@ async def main():
     logger.info(f"Бот запущен! Время MSK: {datetime.now(MSK).strftime('%Y-%m-%d %H:%M:%S')}")
     await application.initialize()
     await application.start()
-    # ✅ Безопасный запуск polling с рестартом при конфликте
     try:
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён")
@@ -1076,7 +1065,7 @@ async def main():
     except Conflict as e:
         logger.error(f"Конфликт polling: {e}")
         await asyncio.sleep(5)
-        raise  # ✅ Перезапуск контейнера Render
+        raise
     except Exception as e:
         logger.error(f"Ошибка запуска polling: {e}")
         raise
@@ -1089,4 +1078,4 @@ async def main():
         await application.stop()
 
 if __name__ == '__main__':
-    asyncio.run(main())
+    asyncio.run(main())О
