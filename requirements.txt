@@ -1,3 +1,4 @@
+--only-binary :all:
 python-telegram-bot==20.8
 supabase==2.6.0
 pandas==2.2.2
