@@ -30,7 +30,7 @@ from cachetools import TTLCache
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, Bot
 from telegram.ext import Application, ContextTypes
 from telegram.constants import ParseMode
-from telegram.error import Conflict, BadRequest, Unauthorized, Forbidden
+from telegram.error import Conflict, BadRequest, Forbidden
 from supabase import create_client, Client
 import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
@@ -305,7 +305,7 @@ async def check_user_in_chat(bot: Bot, user_id: int, chat_id: Any) -> Optional[b
     try:
         member = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
         return member.status not in ['left', 'kicked']
-    except (BadRequest, Unauthorized) as e:
+    except (BadRequest, Forbidden) as e:
         logger.warning(f"Не удалось проверить участника {user_id}: {type(e).__name__}")
         return None
     except Exception as e:
