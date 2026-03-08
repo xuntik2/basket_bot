@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Обработчики команд бота"""
+"""
+Обработчики команд бота
+Версия 22.1 — Production Ready
+"""
 from __future__ import annotations
 import asyncio
 import logging
@@ -20,7 +23,6 @@ from services import (
     build_user_mention,
     check_user_in_chat,
     validate_user_id,
-    validate_birth_date_dd_mm,
     admin_required,
     rate_limit_check,
     chat_member_handler,
@@ -36,6 +38,7 @@ logger = logging.getLogger(__name__)
 # ==================== КОМАНДЫ ====================
 @rate_limit_check
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /start"""
     try:
         user = update.effective_user
         await update.message.reply_text(
@@ -53,6 +56,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @rate_limit_check
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /help"""
     try:
         user = update.effective_user
         config = context.application.bot_data.get('config')
@@ -81,6 +85,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 @rate_limit_check
 async def set_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /setbirthday"""
     try:
         user = update.effective_user
         if not context.args or len(context.args) < 1:
@@ -121,6 +126,7 @@ async def set_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 @rate_limit_check
 async def my_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Показать пользователю его текущую дату рождения из БД"""
     try:
         user = update.effective_user
         db_manager = context.application.bot_data.get('db_manager')
@@ -143,6 +149,10 @@ async def my_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE
 @admin_required
 @rate_limit_check
 async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Ручное создание опроса: только в группе, и именно в той группе, где вызвали команду.
+    FIX: Убрано сообщение "Опрос создан" — админ и так видит опрос в чате.
+    """
     try:
         user = update.effective_user
         chat = update.effective_chat
@@ -162,6 +172,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         target_chat_id = chat.id
+
         training_date = PollManager.get_training_date()
         training_date_iso = PollManager.get_training_date_iso()
         poll_id = f"manual_{datetime.now(MSK).strftime('%Y%m%d_%H%M%S')}"
@@ -183,8 +194,11 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             metrics=metrics
         )
 
-        await update.message.reply_text("✅ Опрос создан в текущей группе.")
-        logger.info(f"Ручной опрос создан админом {user.username or user.id}: poll_id={poll_id}, chat_id={target_chat_id}")
+        # ✅ FIX: Убрано сообщение "Опрос создан в текущей группе" — админ и так видит опрос
+        logger.info(
+            f"Ручной опрос создан админом {user.username or user.id}: "
+            f"poll_id={poll_id}, chat_id={target_chat_id}"
+        )
     except Exception as e:
         logger.error(f"Ошибка в poll_command: {e}", exc_info=True)
         await update.message.reply_text(f"❌ Ошибка создания опроса: {type(e).__name__}")
@@ -200,6 +214,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_required
 @rate_limit_check
 async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /stats (полная статистика)"""
     try:
         user = update.effective_user
         db_manager = context.application.bot_data.get('db_manager')
@@ -234,6 +249,10 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 @admin_required
 @rate_limit_check
 async def monthly_stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик команды /monthlystats (статистика за месяц).
+    FIX: 1-го числа отправляет статистику за предыдущий месяц.
+    """
     try:
         user = update.effective_user
         db_manager = context.application.bot_data.get('db_manager')
@@ -242,6 +261,7 @@ async def monthly_stats_command(update: Update, context: ContextTypes.DEFAULT_TY
         # Исправление: берём предыдущий месяц
         first_of_month = now.day == 1 and now.hour < 12
         if first_of_month:
+            # 1-го числа до обеда отправляем статистику за прошлый месяц
             if now.month == 1:
                 year, month = now.year - 1, 12
             else:
@@ -276,6 +296,7 @@ async def monthly_stats_command(update: Update, context: ContextTypes.DEFAULT_TY
 @admin_required
 @rate_limit_check
 async def add_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Обработчик команды /addbirthday (добавление ДР админом)"""
     try:
         user = update.effective_user
         if not context.args or len(context.args) < 3:
@@ -318,6 +339,13 @@ async def add_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Обработчик нажатий на кнопки опроса.
+    FIX: 
+    1. Использует get_poll_training_date() из БД вместо regex
+    2. Проверяет результат save_response()
+    3. Не редактирует сообщение с "Вы выбрали..."
+    """
     try:
         query = update.callback_query
         if not query:
@@ -359,6 +387,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         db_manager = context.application.bot_data.get('db_manager')
         metrics = context.application.bot_data.get('metrics')
 
+        # FIX: Проверяем результат сохранения
         saved = await db_manager.save_response(
             poll_id=poll_id,
             user_id=user.id,
@@ -372,12 +401,15 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await query.answer("❌ Не удалось сохранить ответ", show_alert=True)
             return
 
+        # FIX: Берём дату из БД вместо regex
         training_date = await db_manager.get_poll_training_date(poll_id)
         if not training_date:
             training_date = "Неизвестно"
 
+        # FIX: Не редактируем сообщение, а просто отвечаем
         await query.answer(f"✅ Ваш ответ: {PollManager.RESPONSES[response]}")
 
+        # Обновляем сообщение опроса с результатами
         await PollManager.update_poll_message(
             bot=context.bot,
             chat_id=message.chat_id,
@@ -399,6 +431,10 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ==================== АВТОМАТИЧЕСКИЕ ЗАДАЧИ ====================
 async def scheduled_poll(application: Application):
+    """
+    Создание автоматического опроса по расписанию.
+    FIX: Добавлена проверка poll_exists() для идемпотентности.
+    """
     config = application.bot_data.get('config')
     db_manager = application.bot_data.get('db_manager')
     metrics = application.bot_data.get('metrics')
@@ -411,12 +447,11 @@ async def scheduled_poll(application: Application):
     training_date_iso = PollManager.get_training_date_iso()
     poll_id = f"auto_{datetime.now(MSK).strftime('%Y%m%d')}"
     
-    # 1. Проверка существования
+    # FIX: Проверка существования опроса перед отправкой
     if await db_manager.poll_exists(poll_id):
         logger.info(f"Опрос {poll_id} уже существует, пропускаем")
         return
     
-    # 2. Отправка сообщения
     text = PollManager.create_poll_text(training_date)
     message = await application.bot.send_message(
         chat_id=config.group_chat_id,
@@ -425,7 +460,6 @@ async def scheduled_poll(application: Application):
         parse_mode=ParseMode.HTML
     )
     
-    # 3. Сохранение в БД
     saved = await db_manager.save_poll(
         poll_id=poll_id,
         message_id=message.message_id,
@@ -435,7 +469,7 @@ async def scheduled_poll(application: Application):
         metrics=metrics
     )
     
-    # 4. Откат при ошибке сохранения
+    # FIX: Откат при ошибке сохранения
     if not saved:
         logger.error(f"Не удалось сохранить опрос {poll_id} в БД, удаляем сообщение")
         try:
@@ -450,6 +484,10 @@ async def scheduled_poll(application: Application):
 
 
 async def scheduled_monthly_stats(application: Application):
+    """
+    Отправка автоматической месячной статистики.
+    FIX: 1-го числа отправляет статистику за предыдущий месяц.
+    """
     config = application.bot_data.get('config')
     db_manager = application.bot_data.get('db_manager')
     now = datetime.now(MSK)
