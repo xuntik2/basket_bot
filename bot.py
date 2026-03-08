@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 Telegram Bot для учета посещаемости тренировок
-Версия 22.1 — Production Ready с интегрированным shutdown flag
-ИЗМЕНЕНИЯ В ВЕРСИИ 22.1:
+Версия 22.2 — Production Ready с полной интеграцией shutdown
+ИЗМЕНЕНИЯ В ВЕРСИИ 22.2:
 - Интегрирован shutdown flag (request_shutdown вызывается при graceful shutdown)
 - Убран daemon=True из Flask thread
 - Добавлен periodic health refresh task
 - Правильные импорты из services.py и handlers.py
+- Все улучшения v22.1 интегрированы
 """
 from __future__ import annotations
 import asyncio
