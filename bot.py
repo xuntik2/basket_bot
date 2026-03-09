@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 Telegram Bot для учета посещаемости тренировок
-Версия 22.2 — Production Ready с полной интеграцией shutdown
+Версия 22.2 — Production Ready с улучшенной обработкой webhook
 ИЗМЕНЕНИЯ В ВЕРСИИ 22.2:
-- Интегрирован shutdown flag (request_shutdown вызывается при graceful shutdown)
-- Убран daemon=True из Flask thread
-- Добавлен periodic health refresh task
-- Правильные импорты из services.py и handlers.py
-- Все улучшения v22.1 интегрированы
+- Проверка webhook_info перед start_polling
+- Пауза 5 секунд после удаления webhook
+- Скрытые команды для не-админов в личных сообщениях
+- Интегрирован shutdown flag
+- Retry для Supabase с tenacity
+- Таймауты на БД операции
 """
 from __future__ import annotations
 import asyncio
@@ -22,9 +23,11 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from flask import Flask, jsonify
 from supabase import create_client
-from telegram import Update
+from telegram import Update, BotCommand
+from telegram.constants import BotCommandScopeType
 from telegram.error import Conflict
-from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler
+from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler, MessageHandler, filters
+from telegram.ext import CommandHandler
 
 from services import (
     MSK,
@@ -57,6 +60,7 @@ from handlers import (
     set_birthday_command,
     start_command,
     stats_command,
+    new_member_handler,
 )
 
 logging.basicConfig(
@@ -216,7 +220,6 @@ def create_flask_app(runtime_state: BotRuntimeState, metrics: BotMetrics) -> Fla
 
     @app.route('/health')
     def health():
-        # Проверка shutdown флага
         if runtime_state.is_shutdown_requested():
             return jsonify({'status': 'shutting_down'}), 503
         
@@ -250,10 +253,62 @@ def run_flask(port: int, runtime_state: BotRuntimeState, metrics: BotMetrics) ->
     app.run(host='0.0.0.0', port=port, use_reloader=False, threaded=True)
 
 
+async def setup_bot_commands(application: Application) -> None:
+    """
+    Настройка команд бота с разделением для админов и обычных пользователей.
+    """
+    config = application.bot_data.get('config')
+    if not config:
+        return
+
+    # Команды для всех пользователей (включая личные сообщения)
+    user_commands = [
+        BotCommand('start', 'Начать работу'),
+        BotCommand('setbirthday', 'Указать день рождения (ДД-ММ)'),
+        BotCommand('mybirthday', 'Посмотреть свой день рождения'),
+    ]
+
+    # Команды только для админов
+    admin_commands = user_commands + [
+        BotCommand('help', 'Показать справку'),
+        BotCommand('poll', 'Создать опрос в группе'),
+        BotCommand('stats', 'Полная статистика (Excel)'),
+        BotCommand('monthlystats', 'Статистика за месяц'),
+        BotCommand('addbirthday', 'Добавить ДР пользователю'),
+    ]
+
+    try:
+        # Установить команды для всех пользователей (по умолчанию)
+        await application.bot.set_my_commands(user_commands)
+        logger.info("Команды бота установлены для всех пользователей")
+
+        # Установить расширенные команды для админов в группе
+        if config.group_chat_id:
+            await application.bot.set_my_commands(
+                admin_commands,
+                scope={'type': 'chat', 'chat_id': config.group_chat_id}
+            )
+            logger.info("Команды администратора установлены для группы")
+
+        # Установить команды для каждого админа в личных сообщениях
+        for admin_id in config.admin_user_ids:
+            await application.bot.set_my_commands(
+                admin_commands,
+                scope={'type': 'chat', 'chat_id': admin_id}
+            )
+            logger.info(f"Команды администратора установлены для admin_id={admin_id}")
+
+    except Exception as e:
+        logger.error(f"Ошибка установки команд бота: {e}")
+
+
 async def main() -> None:
     config = BotConfig()
     if not config.is_valid():
         logger.error('Не все переменные окружения настроены')
+        logger.error(f"BOT_TOKEN: {'set' if config.bot_token else 'missing'}")
+        logger.error(f"SUPABASE_URL: {'set' if config.supabase_url else 'missing'}")
+        logger.error(f"SUPABASE_KEY: {'set' if config.supabase_key else 'missing'}")
         return
 
     supabase_client = create_client(config.supabase_url, config.supabase_key)
@@ -262,6 +317,7 @@ async def main() -> None:
     metrics = BotMetrics()
     runtime_state = BotRuntimeState()
 
+    # Проверка БД
     db_ok, db_message = await db_manager.check_database_health()
     runtime_state.set_database_health(db_ok, db_message)
     if not db_ok:
@@ -269,6 +325,7 @@ async def main() -> None:
 
     await db_manager.init_tables()
 
+    # Создание приложения
     application = Application.builder().token(config.bot_token).build()
     application.bot_data.update({
         'config': config,
@@ -278,6 +335,7 @@ async def main() -> None:
         'runtime_state': runtime_state,
     })
 
+    # Регистрация обработчиков
     application.add_handler(CommandHandler('start', start_command))
     application.add_handler(CommandHandler('help', help_command))
     application.add_handler(CommandHandler('poll', poll_command))
@@ -288,52 +346,84 @@ async def main() -> None:
     application.add_handler(CommandHandler('mybirthday', my_birthday_command))
     application.add_handler(CallbackQueryHandler(poll_callback, pattern='^poll:'))
     application.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER))
+    # Fallback для новых участников (работает без прав админа)
+    application.add_handler(MessageHandler(filters.StatusUpdate.NEW_MEMBERS, new_member_handler))
     application.add_error_handler(error_handler)
 
+    # Настройка планировщика
     scheduler = setup_scheduler(application, runtime_state, rate_limiter)
     
+    # Настройка graceful shutdown
+    shutdown_manager = GracefulShutdown()
+    shutdown_manager.setup(application, scheduler)
+
     # Запуск Flask в отдельном потоке (НЕ daemon=True!)
     flask_thread = Thread(
         target=run_flask,
         args=(config.port, runtime_state, metrics),
-        daemon=False  # FIX: теперь не daemon, shutdown контролируется через runtime_state
+        daemon=False
     )
     flask_thread.start()
     logger.info(f'Flask запущен на порту {config.port}')
 
-    shutdown_manager = GracefulShutdown()
-    shutdown_manager.setup(application, scheduler, flask_thread)
-
     await application.initialize()
     await application.start()
 
+    # Настройка команд бота (разделение для админов и пользователей)
+    await setup_bot_commands(application)
+
+    # === УЛУЧШЕННАЯ ОБРАБОТКА WEBHOOK ===
+    logger.info("Проверка и очистка webhook...")
+    
+    # 1. Проверяем текущий статус webhook
+    webhook_info = await application.bot.get_webhook_info()
+    if webhook_info.url:
+        logger.warning(f"Webhook ещё активен: {webhook_info.url}")
+        logger.info("Удаление webhook...")
+        await application.bot.delete_webhook(drop_pending_updates=True)
+        logger.info("Webhook удалён")
+        # 2. Пауза для применения изменений в Telegram
+        logger.info("Ожидание применения изменений в Telegram (5 сек)...")
+        await asyncio.sleep(5)
+    else:
+        logger.info("Webhook не активен")
+    
+    # 3. Запуск polling
     max_retries = 3
     retry_delay = 30
     for attempt in range(max_retries):
         try:
-            await application.bot.delete_webhook(drop_pending_updates=True)
-            await asyncio.sleep(2)
             await application.updater.start_polling(
                 allowed_updates=Update.ALL_TYPES,
                 drop_pending_updates=True,
             )
             logger.info('Polling запущен успешно')
             break
-        except Conflict:
+        except Conflict as e:
             if attempt < max_retries - 1:
-                logger.warning('Conflict (%s/%s), ждём %s сек...', attempt + 1, max_retries, retry_delay)
+                logger.warning('Conflict (попытка %s/%s). Ждём %s сек...', attempt + 1, max_retries, retry_delay)
                 await asyncio.sleep(retry_delay)
             else:
+                logger.error('Не удалось запустить polling после %s попыток', max_retries)
                 raise
+        except Exception as e:
+            logger.error(f"Ошибка запуска polling: {e}", exc_info=True)
+            raise
 
+    # Проверка пропущенных поздравлений при старте
     await run_daily_birthdays_with_guard(application)
     await refresh_database_health(runtime_state, db_manager)
+
+    logger.info('Бот запущен и готов к работе!')
+    logger.info(f'Health endpoint: http://0.0.0.0:{config.port}/health')
+    logger.info(f'Metrics endpoint: http://0.0.0.0:{config.port}/metrics')
 
     try:
         await shutdown_manager.wait()
     except (KeyboardInterrupt, SystemExit):
         logger.info('Получен KeyboardInterrupt, завершение...')
     finally:
+        logger.info("Остановка бота...")
         if scheduler.running:
             scheduler.shutdown(wait=False)
         try:
@@ -343,6 +433,7 @@ async def main() -> None:
             logger.exception('Ошибка остановки updater')
         await application.stop()
         await application.shutdown()
+        logger.info("Бот остановлен")
 
 
 if __name__ == '__main__':
