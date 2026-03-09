@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """
 Основные сервисы и бизнес-логика бота
-Версия 22.1 — Production Ready с интегрированным shutdown flag
-ИЗМЕНЕНИЯ В ВЕРСИИ 22.1:
+Версия 22.2 — Production Ready с интегрированным shutdown flag
+ИЗМЕНЕНИЯ В ВЕРСИИ 22.2:
 - Интегрирован _shutdown_flag (request_shutdown / is_shutdown_requested)
 - Добавлен retry для Supabase запросов (tenacity)
 - Добавлены таймауты на БД операции (10 секунд)
 - Periodic health refresh задача
-- Убран daemon=True из Flask thread
-- Улучшена модульная архитектура импортов
+- 3-state check_user_in_chat (True/False/None)
+- validate_birth_date_dd_mm с поддержкой 29-02
+- sanitize_html_summary для безопасного RSS
+- poll_exists() и get_poll_training_date() helper методы
+- upsert для save_poll с on_conflict='poll_id'
+- run_daily_birthdays_with_guard с проверкой stats
 """
 import os
 import logging
