@@ -236,7 +236,7 @@ async def main() -> None:
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён")
         logger.info("Ожидание применения изменений в Telegram (5 сек)...")
-        await asyncio_delay = 30
+        await asyncio.sleep(30)
     for attempt in range(max_retries):
         try:
             await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
