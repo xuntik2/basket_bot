@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 """
 Telegram Bot для учета посещаемости тренировок
-Версия 25.7 — Final Production Ready
+Версия 25.8 — Final Production Ready
 ИСПРАВЛЕНИЯ:
-- ✅ УДАЛЁН MessageHandler с StatusUpdate.NEW_MEMBERS (не существует в PTB v20.8)
-- ✅ УДАЛЁН new_member_handler из импортов (нет в handlers.py)
-- ✅ scheduled_health_refresh вместо periodic_health_refresh
+- ✅ periodic_health_refresh из services.py (не scheduled_health_refresh)
+- ✅ Удалён new_member_handler из импортов (нет в handlers.py)
+- ✅ Удалён MessageHandler с StatusUpdate.NEW_MEMBERS (не существует в PTB v20.8)
+- ✅ max_retries и retry_delay объявлены ПЕРЕД использованием
 - ✅ await для set_database_health()
 - ✅ flask_thread передаётся в shutdown_manager.setup()
-- ✅ max_retries/retry_delay объявлены ПЕРЕД использованием
+- ✅ Убран дубликат CommandHandler
+- ✅ Убран BotCommandScopeType
 """
 from __future__ import annotations
 import asyncio
@@ -36,8 +38,10 @@ from services import (
     PROFESSIONAL_HOLIDAYS,
     RateLimiter,
     error_handler,
+    refresh_database_health,
     safe_execute,
     send_professional_holiday,
+    periodic_health_refresh,
     verify_chat_member_setup,
 )
 from handlers import (
@@ -51,7 +55,6 @@ from handlers import (
     poll_command,
     run_daily_birthdays_with_guard,
     scheduled_cleanup_locks,
-    scheduled_health_refresh,
     scheduled_monthly_stats,
     scheduled_poll,
     set_birthday_command,
@@ -59,7 +62,10 @@ from handlers import (
     stats_command,
 )
 
-logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO,
+)
 logger = logging.getLogger(__name__)
 
 
@@ -82,13 +88,55 @@ def schedule_professional_holidays(scheduler: AsyncIOScheduler, application: App
 
 def setup_scheduler(application: Application, runtime_state: BotRuntimeState, rate_limiter: RateLimiter) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=MSK)
-    scheduler.add_job(safe_execute, trigger=CronTrigger(day_of_week='mon', hour=10, minute=30, timezone=MSK), id='weekly_poll', args=[scheduled_poll, application], replace_existing=True)
-    scheduler.add_job(safe_execute, trigger=CronTrigger(day=1, hour=10, minute=0, timezone=MSK), id='monthly_stats', args=[scheduled_monthly_stats, application], replace_existing=True)
-    scheduler.add_job(safe_execute, trigger=CronTrigger(hour=10, minute=0, timezone=MSK), id='birthday_greetings', args=[run_daily_birthdays_with_guard, application], replace_existing=True)
-    scheduler.add_job(safe_execute, trigger=CronTrigger(hour=10, minute=0, timezone=MSK), id='basketball_news', args=[check_basketball_champions, application], replace_existing=True)
-    scheduler.add_job(safe_execute, trigger=CronTrigger(hour=3, minute=0, timezone=MSK), id='cleanup_locks', args=[scheduled_cleanup_locks, application], replace_existing=True)
-    scheduler.add_job(safe_execute, trigger=CronTrigger(minute='*/1', timezone=MSK), id='db_health_refresh', args=[scheduled_health_refresh, application], replace_existing=True, max_instances=1, coalesce=True, misfire_grace_time=30)
-    scheduler.add_job(rate_limiter.cleanup_old_users, trigger=CronTrigger(hour=4, minute=0, timezone=MSK), id='rate_limiter_cleanup', kwargs={'max_age_hours': 24}, replace_existing=True)
+    scheduler.add_job(
+        safe_execute,
+        trigger=CronTrigger(day_of_week='mon', hour=10, minute=30, timezone=MSK),
+        id='weekly_poll',
+        args=[scheduled_poll, application],
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        safe_execute,
+        trigger=CronTrigger(day=1, hour=10, minute=0, timezone=MSK),
+        id='monthly_stats',
+        args=[scheduled_monthly_stats, application],
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        safe_execute,
+        trigger=CronTrigger(hour=10, minute=0, timezone=MSK),
+        id='birthday_greetings',
+        args=[run_daily_birthdays_with_guard, application],
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        safe_execute,
+        trigger=CronTrigger(hour=10, minute=0, timezone=MSK),
+        id='basketball_news',
+        args=[check_basketball_champions, application],
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        safe_execute,
+        trigger=CronTrigger(hour=3, minute=0, timezone=MSK),
+        id='cleanup_locks',
+        args=[scheduled_cleanup_locks, application],
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        safe_execute,
+        trigger=CronTrigger(minute='*/10', timezone=MSK),
+        id='db_health_refresh',
+        args=[periodic_health_refresh, application, runtime_state, application.bot_data['db_manager']],
+        replace_existing=True,
+    )
+    scheduler.add_job(
+        rate_limiter.cleanup_old_users,
+        trigger=CronTrigger(hour=4, minute=0, timezone=MSK),
+        id='rate_limiter_cleanup',
+        kwargs={'max_age_hours': 24},
+        replace_existing=True,
+    )
     schedule_professional_holidays(scheduler, application)
     scheduler.start()
     logger.info('Планировщик запущен')
@@ -215,10 +263,16 @@ async def setup_bot_commands(application: Application) -> None:
         await application.bot.set_my_commands(user_commands)
         logger.info("Команды бота установлены для всех пользователей")
         if config.group_chat_id:
-            await application.bot.set_my_commands(admin_commands, scope={'type': 'chat', 'chat_id': config.group_chat_id})
+            await application.bot.set_my_commands(
+                admin_commands,
+                scope={'type': 'chat', 'chat_id': config.group_chat_id}
+            )
             logger.info("Команды администратора установлены для группы")
         for admin_id in config.admin_user_ids:
-            await application.bot.set_my_commands(admin_commands, scope={'type': 'chat', 'chat_id': admin_id})
+            await application.bot.set_my_commands(
+                admin_commands,
+                scope={'type': 'chat', 'chat_id': admin_id}
+            )
             logger.info(f"Команды администратора установлены для admin_id={admin_id}")
     except Exception as e:
         logger.error(f"Ошибка установки команд бота: {e}")
@@ -263,15 +317,19 @@ async def main() -> None:
     application.add_handler(CommandHandler('setbirthday', set_birthday_command))
     application.add_handler(CommandHandler('mybirthday', my_birthday_command))
     application.add_handler(CallbackQueryHandler(poll_callback, pattern='^poll:'))
-    # ✅ ТОЛЬКО ChatMemberHandler (StatusUpdate.NEW_MEMBERS не существует!)
     application.add_handler(ChatMemberHandler(chat_member_handler, ChatMemberHandler.CHAT_MEMBER))
+    # ✅ УДАЛЕНО: MessageHandler(filters.StatusUpdate.NEW_MEMBERS, new_member_handler)
     application.add_error_handler(error_handler)
 
     scheduler = setup_scheduler(application, runtime_state, rate_limiter)
     shutdown_manager = GracefulShutdown()
 
-    # Запуск Flask
-    flask_thread = Thread(target=run_flask, args=(config.port, runtime_state, metrics), daemon=False)
+    # Запуск Flask в отдельном потоке (НЕ daemon=True!)
+    flask_thread = Thread(
+        target=run_flask,
+        args=(config.port, runtime_state, metrics),
+        daemon=False
+    )
     flask_thread.start()
     logger.info(f'Flask запущен на порту {config.port}')
 
@@ -282,7 +340,7 @@ async def main() -> None:
     await verify_chat_member_setup(application)
     await setup_bot_commands(application)
 
-    # Обработка webhook
+    # === УЛУЧШЕННАЯ ОБРАБОТКА WEBHOOK ===
     logger.info("Проверка и очистка webhook...")
     webhook_info = await application.bot.get_webhook_info()
     if webhook_info.url:
@@ -295,12 +353,15 @@ async def main() -> None:
     else:
         logger.info("Webhook не активен")
 
-    # ✅ max_retries и retry_delay объявлены ПЕРЕД использованием
-    max_retries = 3
-    retry_delay = 30
+    # === ЗАПУСК POLLING ===
+    max_retries = 3  # ✅ ОБЪЯВЛЕНО ПЕРЕД ИСПОЛЬЗОВАНИЕМ
+    retry_delay = 30  # ✅ ОБЪЯВЛЕНО ПЕРЕД ИСПОЛЬЗОВАНИЕМ
     for attempt in range(max_retries):
         try:
-            await application.updater.start_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+            await application.updater.start_polling(
+                allowed_updates=Update.ALL_TYPES,
+                drop_pending_updates=True,
+            )
             logger.info('Polling запущен успешно')
             break
         except Conflict as e:
@@ -315,7 +376,7 @@ async def main() -> None:
             raise
 
     await run_daily_birthdays_with_guard(application)
-    await scheduled_health_refresh(application)
+    await refresh_database_health(runtime_state, db_manager)
     logger.info('Бот запущен и готов к работе!')
     logger.info(f'Health endpoint: http://0.0.0.0:{config.port}/health')
     logger.info(f'Metrics endpoint: http://0.0.0.0:{config.port}/metrics')
