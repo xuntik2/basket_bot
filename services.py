@@ -3,11 +3,10 @@
 Основные сервисы и бизнес-логика бота
 Версия 25.7 — Production Ready
 ИСПРАВЛЕНИЯ:
-- ✅ set_database_health — async (согласовано с bot.py)
-- ✅ notify_owner с cooldown (защита от спама)
+- ✅ scheduled_health_refresh вместо periodic_health_refresh (без while loop)
+- ✅ verify_chat_member_setup для self-check
 - ✅ should_skip_welcome для антидубля приветствий
-- ✅ save_response через upsert (1 запрос вместо 2)
-- ✅ Удалены дубли scheduled_* (только в handlers.py)
+- ✅ notify_owner с cooldown
 - ✅ ThreadLock для кросс-поточного доступа (Flask + async)
 """
 import os
@@ -57,7 +56,7 @@ _OWNER_ERROR_CACHE: Dict[str, datetime] = {}
 _OWNER_ERROR_CACHE_LOCK = ThreadLock()
 
 def _should_notify_owner(error_key: str) -> bool:
-    """✅ ДОБАВЛЕНО: Cooldown для уведомлений владельцу"""
+    """Cooldown для уведомлений владельцу"""
     now = datetime.now(MSK)
     with _OWNER_ERROR_CACHE_LOCK:
         last_sent = _OWNER_ERROR_CACHE.get(error_key)
@@ -71,7 +70,7 @@ _recent_welcomes: Dict[str, float] = {}
 _recent_welcomes_lock = asyncio.Lock()
 
 async def should_skip_welcome(chat_id: Any, user_id: int, ttl_seconds: int = WELCOME_DEDUP_TTL_SECONDS) -> bool:
-    """✅ ДОБАВЛЕНО: Защита от дублей приветствий"""
+    """Защита от дублей приветствий"""
     now = time.time()
     key = f"{chat_id}:{user_id}"
     async with _recent_welcomes_lock:
@@ -116,7 +115,7 @@ class BotRuntimeState:
         self._db_status = {'status': 'unknown', 'message': 'database check not run yet', 'checked_at': None}
         self._shutdown_flag = asyncio.Event()
 
-    async def set_database_health(self, ok: bool, message: str) -> None:  # ✅ ASYNC!
+    async def set_database_health(self, ok: bool, message: str) -> None:
         with self._lock:
             self._db_status = {'status': 'ok' if ok else 'error', 'message': message, 'checked_at': datetime.now(MSK).isoformat()}
 
@@ -257,7 +256,7 @@ def build_user_mention(user_id: Optional[int], full_name: str, username: str = "
     return safe_name
 
 # ==================== УВЕДОМЛЕНИЯ ====================
-async def notify_owner(bot: Bot, text: str, config: BotConfig, *, error_key: Optional[str] = None, use_cooldown: bool = True) -> bool:  # ✅ С COOLDOWN
+async def notify_owner(bot: Bot, text: str, config: BotConfig, *, error_key: Optional[str] = None, use_cooldown: bool = True) -> bool:
     if not config.owner_id:
         return False
     try:
@@ -282,7 +281,7 @@ async def check_user_in_chat(bot: Bot, user_id: int, chat_id: Any) -> Optional[b
         logger.warning(f"Ошибка проверки участника {user_id}: {e}")
         return None
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):  # ✅ С COOLDOWN
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     error = context.error
     if isinstance(error, (KeyboardInterrupt, SystemExit)):
         return
@@ -296,7 +295,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):  # 
         error_key = f"global:{type(error).__name__}:{truncate_text_safe(str(error))[:120]}"
         await notify_owner(context.bot, error_text, config, error_key=error_key, use_cooldown=True)
 
-async def safe_execute(job_func: Callable, application: Application, *args, **kwargs):  # ✅ С COOLDOWN
+async def safe_execute(job_func: Callable, application: Application, *args, **kwargs):
     try:
         await job_func(application, *args, **kwargs)
     except (KeyboardInterrupt, SystemExit):
@@ -338,6 +337,7 @@ def rate_limit_check(func: Callable) -> Callable:
 
 # ==================== SELF-CHECK ====================
 async def verify_chat_member_setup(application: Application) -> None:
+    """Проверка настроек бота при старте"""
     config = application.bot_data.get('config')
     if not config or not config.group_chat_id:
         logger.warning("verify_chat_member_setup: GROUP_CHAT_ID не задан")
@@ -449,7 +449,7 @@ class DatabaseManager:
                 await metrics.increment('errors_count')
             return False
 
-    async def save_response(self, poll_id: str, user_id: int, username: str, full_name: str, response: str, metrics: BotMetrics = None) -> bool:  # ✅ UPSERT
+    async def save_response(self, poll_id: str, user_id: int, username: str, full_name: str, response: str, metrics: BotMetrics = None) -> bool:
         poll_lock = await self._get_poll_lock(poll_id)
         async with poll_lock:
             try:
@@ -718,7 +718,7 @@ def create_excel_from_dataframe(df: pd.DataFrame, filename_prefix: str = "stats"
     return output
 
 # ==================== ПРИВЕТСТВИЕ ====================
-async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):  # ✅ С should_skip_welcome
+async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         if not update.chat_member:
             return
@@ -927,4 +927,10 @@ async def scheduled_cleanup_locks(application: Application):
         cleaned = await rate_limiter.cleanup_old_users(max_age_hours=24)
         logger.info(f"Очищено {cleaned} старых записей rate limiter")
 
-# ✅ УДАЛЕНО: periodic_health_refresh (теперь только scheduled_health_refresh в handlers.py)
+async def scheduled_health_refresh(application: Application) -> None:
+    """✅ Однократное обновление health (для scheduler)"""
+    db_manager = application.bot_data.get('db_manager')
+    runtime_state = application.bot_data.get('runtime_state')
+    if runtime_state and db_manager:
+        await refresh_database_health(runtime_state, db_manager)
+        logger.info("Health check выполнен по расписанию")
