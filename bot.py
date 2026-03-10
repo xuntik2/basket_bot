@@ -3,10 +3,10 @@
 Telegram Bot для учета посещаемости тренировок
 Версия 25.9 — Final Production Ready
 ИСПРАВЛЕНИЯ:
-- ✅ Удалён verify_tables из импортов (метод класса, не функция модуля)
-- ✅ scheduled_health_refresh вместо periodic_health_refresh
+- ✅ scheduled_health_refresh вместо periodic_health_refresh (критично)
 - ✅ Убраны лишние аргументы из scheduler для health check
-- ✅ scope для set_my_commands использует BotCommandScopeChat (типобезопасно)
+- ✅ BotCommandScopeChat импортируется из telegram (не telegram.ext)
+- ✅ verify_tables вызывается через экземпляр db_manager (не как функция модуля)
 """
 from __future__ import annotations
 import asyncio
@@ -21,10 +21,9 @@ from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.date import DateTrigger
 from flask import Flask, jsonify
 from supabase import create_client
-from telegram import Update, BotCommand
+from telegram import Update, BotCommand, BotCommandScopeChat  # ✅ ИСПРАВЛЕНО: BotCommandScopeChat из telegram
 from telegram.error import Conflict
 from telegram.ext import Application, CallbackQueryHandler, ChatMemberHandler, CommandHandler
-from telegram.ext import BotCommandScopeChat  # ✅ ДОБАВЛЕНО для типобезопасности
 from services import (
     MSK,
     SHUTDOWN_TIMEOUT,
@@ -40,7 +39,6 @@ from services import (
     send_professional_holiday,
     scheduled_health_refresh,  # ✅ ИСПРАВЛЕНО: было periodic_health_refresh
     verify_chat_member_setup,
-    # ✅ УДАЛЕНО: verify_tables — это метод класса DatabaseManager, не функция модуля
 )
 from handlers import (
     add_birthday_command,
@@ -239,7 +237,7 @@ async def setup_bot_commands(application: Application) -> None:
         await application.bot.set_my_commands(user_commands)
         logger.info("Команды бота установлены для всех пользователей")
         if config.group_chat_id:
-            # ✅ ИСПОЛЬЗУЕМ BotCommandScopeChat вместо dict для типобезопасности
+            # ✅ ИСПОЛЬЗУЕМ BotCommandScopeChat из telegram (не dict)
             scope = BotCommandScopeChat(chat_id=config.group_chat_id)
             await application.bot.set_my_commands(admin_commands, scope=scope)
             logger.info("Команды администратора установлены для группы")
