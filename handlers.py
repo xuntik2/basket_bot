@@ -34,8 +34,6 @@ from services import (
     check_basketball_champions,
     scheduled_cleanup_locks,
     scheduled_health_refresh,
-    scheduled_poll,
-    scheduled_monthly_stats,
 )
 from services import DatabaseManager
 
