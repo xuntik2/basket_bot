@@ -310,7 +310,7 @@ async def main() -> None:
         await application.bot.delete_webhook(drop_pending_updates=True)
         logger.info("Webhook удалён")
         logger.info("Ожидание применения изменений в Telegram (5 сек)...")
-        await asyncio.sleep(5)
+        await asyncio.sleep(15)
     else:
         logger.info("Webhook не активен")
     # === ЗАПУСК POLLING ===
