@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Основные сервисы и бизнес-логика бота
-Версия 25.8 — Production Ready с исправлениями
+Версия 25.9 — С исправлением chat_member_handler
 ИСПРАВЛЕНИЯ:
-- ✅ scheduled_health_refresh (без while loop)
+- ✅ ✅ scheduled_health_refresh (без while loop)
 - ✅ verify_chat_member_setup для self-check
 - ✅ should_skip_welcome для антидубля приветствий
 - ✅ notify_owner с cooldown
 - ✅ ThreadLock для кросс-поточного доступа (Flask + async)
-- ✅ html.escape в build_user_mention для защиты от HTML injection
+- ✅ ✅ chat_member_handler: new_chat_member.status вместо member.status
 """
 import os
 import logging
@@ -217,7 +217,7 @@ def sanitize_html_summary(text: str) -> str:
     return text
 def build_user_mention(user_id: Optional[int], full_name: str, username: str = "") -> str:
     safe_name = full_name or username or "Коллега"
-    safe_name = html.escape(safe_name)  # ✅ ИСПРАВЛЕНО: добавлена защита от HTML injection
+    safe_name = html.escape(safe_name)  # ✅ Защита от HTML injection
     if username:
         username = username.lstrip("@")
         return f"@{username}"
@@ -648,21 +648,32 @@ def create_excel_from_dataframe(df: pd.DataFrame, filename_prefix: str = "stats"
     return output
 # ==================== ПРИВЕТСТВИЕ ====================
 async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """✅ ИСПРАВЛЕНО: правильный доступ к статусам участника"""
     try:
         if not update.chat_member:
             return
-        member = update.chat_member
-        user = member.new_chat_member.user
-        old_status = member.old_chat_member.status if member.old_chat_member else None
-        new_status = member.status
-        chat = update.effective_chat
-        if new_status in ['member', 'administrator'] and old_status not in ['member', 'administrator']:
+        cmu = update.chat_member  # ChatMemberUpdated объект
+        user = cmu.new_chat_member.user
+        chat = cmu.chat
+        
+        # ✅ ИСПРАВЛЕНО: правильный доступ к статусам
+        old_status = cmu.old_chat_member.status if cmu.old_chat_member else None
+        new_status = cmu.new_chat_member.status  # ✅ Было: member.status → AttributeError
+        
+        # ✅ Надёжная логика входа/выхода
+        was_member = old_status in ("member", "administrator", "creator")
+        is_member = new_status in ("member", "administrator", "creator")
+        
+        # Приветствие новых участников
+        if not was_member and is_member:
             skip = await should_skip_welcome(chat.id, user.id)
             if skip:
                 logger.info(f"Антидубль: пропускаем chat_member_handler chat_id={chat.id}, user_id={user.id}")
                 return
             await welcome_new_member(update, context, user)
-        elif new_status in ['left', 'kicked']:
+        
+        # Деактивация ушедших участников
+        elif was_member and new_status in ("left", "kicked"):
             db_manager = context.application.bot_data.get('db_manager')
             if db_manager:
                 await db_manager.mark_user_inactive(user.id)
