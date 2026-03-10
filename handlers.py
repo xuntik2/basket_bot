@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
 """
 Обработчики команд бота
-Версия 25.9 — Production Ready с улучшениями
-ИСПРАВЛЕНИЯ И УЛУЧШЕНИЯ:
-- ✅ Добавлен parse_mode=ParseMode.HTML в set_birthday_command и add_birthday_command
-- ✅ Убраны лишние импорты (scheduled_* функции определены в этом файле)
-- ✅ Используется update.effective_message для надёжности
-- ✅ Сохранены все существующие функции и логика
+Версия 25.10 — Production Ready
+ИСПРАВЛЕНИЯ:
+- ✅ Добавлен validate_birth_date_dd_mm в импорты
+- ✅ Убраны лишние импорты (scheduled_poll и scheduled_monthly_stats определены здесь)
+- ✅ parse_mode=HTML в справочных сообщениях
+- ✅ Убрано логирование админских команд (не показывать в логах какие команды вводит админ)
 """
 from __future__ import annotations
 import asyncio
@@ -35,18 +35,18 @@ from services import (
     check_basketball_champions,
     scheduled_cleanup_locks,
     scheduled_health_refresh,
-    # ✅ УДАЛЕНО: scheduled_poll и scheduled_monthly_stats (определены ниже в этом файле)
+    # ✅ УДАЛЕНО: scheduled_poll, scheduled_monthly_stats — определены ниже
 )
 from services import DatabaseManager
 
 logger = logging.getLogger(__name__)
+
 
 # ==================== КОМАНДЫ ====================
 @rate_limit_check
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         user = update.effective_user
-        # ✅ ИСПОЛЬЗУЕМ effective_message для надёжности
         message = update.effective_message
         if message:
             await message.reply_text(
@@ -60,6 +60,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         config = context.application.bot_data.get('config')
         if config and config.owner_id:
             await notify_owner(context.bot, f"❌ Ошибка в /start: {e}", config)
+
 
 @rate_limit_check
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -84,6 +85,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         logger.error(f"Ошибка в help_command: {e}")
 
+
 @rate_limit_check
 async def set_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -92,7 +94,6 @@ async def set_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
         if not message:
             return
         if not context.args or len(context.args) < 1:
-            # ✅ ИСПРАВЛЕНО: добавлен parse_mode=ParseMode.HTML
             await message.reply_text(
                 "📋 <b>Использование:</b>\n"
                 "/setbirthday ДД-ММ\n"
@@ -115,7 +116,7 @@ async def set_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
             username=user.username or ''
         )
         await message.reply_text(f"✅ Ваш день рождения сохранен: {birth_date}")
-        logger.info(f"Пользователь {user.username} установил ДР: {birth_date}")
+        # ✅ Убрано логирование команды пользователя
     except ValueError as ve:
         message = update.effective_message
         if message:
@@ -128,6 +129,7 @@ async def set_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
         config = context.application.bot_data.get('config')
         if config and config.owner_id:
             await notify_owner(context.bot, f"❌ Ошибка в /setbirthday: {e}", config)
+
 
 @rate_limit_check
 async def my_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -151,6 +153,7 @@ async def my_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE
         message = update.effective_message
         if message:
             await message.reply_text("❌ Не удалось получить дату рождения")
+
 
 @admin_required
 @rate_limit_check
@@ -202,11 +205,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 logger.warning(f"Не удалось удалить ручной опрос после ошибки БД: {delete_error}")
             await message.reply_text("❌ Не удалось сохранить опрос в БД")
             return
-
-        logger.info(
-            f"Ручной опрос создан админом {user.username or user.id}: "
-            f"poll_id={poll_id}, chat_id={target_chat_id}"
-        )
+        # ✅ Убрано логирование админской команды
     except Exception as e:
         logger.error(f"Ошибка в poll_command: {e}", exc_info=True)
         message = update.effective_message
@@ -219,6 +218,7 @@ async def poll_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"❌ Ошибка в /poll: {type(e).__name__}: {truncate_text_safe(str(e))}",
                 config
             )
+
 
 @admin_required
 @rate_limit_check
@@ -246,12 +246,13 @@ async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         finally:
             output.close()
-        logger.info(f"Админ {user.username} получил статистику")
+        # ✅ Убрано логирование админской команды
     except Exception as e:
         logger.error(f"Ошибка статистики: {e}")
         message = update.effective_message
         if message:
             await message.reply_text(f"❌ Ошибка: {e}")
+
 
 @admin_required
 @rate_limit_check
@@ -293,6 +294,7 @@ async def monthly_stats_command(update: Update, context: ContextTypes.DEFAULT_TY
         if message:
             await message.reply_text(f"❌ Ошибка: {e}")
 
+
 @admin_required
 @rate_limit_check
 async def add_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -302,7 +304,6 @@ async def add_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
         if not message:
             return
         if not context.args or len(context.args) < 3:
-            # ✅ ИСПРАВЛЕНО: добавлен parse_mode=ParseMode.HTML
             await message.reply_text(
                 "📋 <b>Использование:</b>\n"
                 "/addbirthday user_id ДД-ММ Фамилия Имя\n"
@@ -312,7 +313,7 @@ async def add_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
             )
             return
         try:
-            user_id = validate_user_id(context.args[0])
+            target_user_id = validate_user_id(context.args[0])
         except ValueError as ve:
             await message.reply_text(f"❌ {ve}")
             return
@@ -324,9 +325,9 @@ async def add_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
             await message.reply_text(f"❌ {ve}")
             return
         db_manager = context.application.bot_data.get('db_manager')
-        await db_manager.add_or_update_birthday(user_id, full_name, birth_date)
+        await db_manager.add_or_update_birthday(target_user_id, full_name, birth_date)
         await message.reply_text(f"✅ Добавлено: {full_name}, ДР {birth_date}")
-        logger.info(f"Админ {user.username} добавил ДР вручную: {full_name} - {birth_date}")
+        # ✅ Убрано логирование админской команды
     except ValueError as ve:
         logger.error(f"Ошибка валидации в /addbirthday: {ve}")
         message = update.effective_message
@@ -340,6 +341,7 @@ async def add_birthday_command(update: Update, context: ContextTypes.DEFAULT_TYP
         config = context.application.bot_data.get('config')
         if config and config.owner_id:
             await notify_owner(context.bot, f"❌ Ошибка в /addbirthday: {e}", config)
+
 
 async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
@@ -397,7 +399,7 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             training_date=training_date,
             db_manager=db_manager
         )
-        logger.info(f"Пользователь {user.username or user.id} выбрал {response} в poll_id={poll_id}")
+        # ✅ Убрано логирование выбора пользователя
     except Exception as e:
         logger.error(f"Ошибка в poll_callback: {e}", exc_info=True)
         try:
@@ -406,7 +408,8 @@ async def poll_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-# ==================== АВТОМАТИЧЕСКИЕ ЗАДАЧИ (определены здесь, не импортировать из services!) ====================
+
+# ==================== АВТОМАТИЧЕСКИЕ ЗАДАЧИ (определены здесь!) ====================
 async def scheduled_poll(application: Application):
     config = application.bot_data.get('config')
     db_manager = application.bot_data.get('db_manager')
@@ -445,6 +448,7 @@ async def scheduled_poll(application: Application):
         except Exception as delete_error:
             logger.warning(f"Не удалось удалить сообщение опроса: {delete_error}")
     logger.info(f"Автоматический опрос создан: {poll_id}")
+
 
 async def scheduled_monthly_stats(application: Application):
     config = application.bot_data.get('config')
