@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 Основные сервисы и бизнес-логика бота
-Версия 25.9 — Production Ready с улучшениями
+Версия 25.10 — Final Production Ready
 ИСПРАВЛЕНИЯ (критичные):
-- ✅ chat_member_handler: new_chat_member.status вместо member.status
+- ✅ chat_member_handler: member.new_chat_member.status вместо member.status
 - ✅ welcome_new_member: убран fallback в общий чат при Forbidden
-УЛУЧШЕНИЯ (от коллег):
-- ✅ build_user_mention: html.escape + clickable mention приоритет
-- ✅ mark_daily_job_done: upsert вместо insert
+- ✅ welcome_new_member: убрано упоминание /start из группового приветствия
+УЛУЧШЕНИЯ (безопасность и надёжность):
+- ✅ build_user_mention: html.escape() + clickable mention приоритет
+- ✅ mark_daily_job_done: upsert вместо insert для защиты от дублей
 - ✅ cleanup_old_locks: возвращает количество удалённых, а не оставшихся
-- ✅ verify_tables: переименовано из init_tables (яснее назначение)
 - ✅ ensure_user_exists: обновляет username/full_name если пользователь есть
-- ✅ GROUP_CHAT_ID: строгая валидация (None вместо строки при ошибке)
+- ✅ BotConfig: строгая валидация GROUP_CHAT_ID (None вместо строки)
+- ✅ verify_tables: переименовано из init_tables (яснее назначение)
 """
 import os
 import logging
@@ -259,7 +260,7 @@ def sanitize_html_summary(text: str) -> str:
     return text
 
 def build_user_mention(user_id: Optional[int], full_name: str, username: str = "") -> str:
-    """✅ УЛУЧШЕНИЕ: clickable mention всегда, если есть user_id"""
+    """✅ УЛУЧШЕНИЕ: clickable mention всегда, если есть user_id + защита от XSS"""
     safe_name = full_name or username or "Коллега"
     safe_name = html.escape(safe_name)  # ✅ Защита от HTML injection
     if user_id:
@@ -810,31 +811,32 @@ async def chat_member_handler(update: Update, context: ContextTypes.DEFAULT_TYPE
         logger.error(f"Ошибка в chat_member_handler: {e}")
 
 async def welcome_new_member(update: Update, context: ContextTypes.DEFAULT_TYPE, user):
-    """✅ ИСПРАВЛЕНО: убран fallback в общий чат при Forbidden"""
+    """✅ ИСПРАВЛЕНО: убран fallback в общий чат при Forbidden + убрано упоминание /start"""
     try:
         full_name = user.full_name or user.first_name or "Коллега"
+        # ✅ УБРАНО предложение про /start из приветствия в группе
         welcome_text = (f"👋 <b>{full_name}</b>, добро пожаловать в наш чат!\n"
                        f"📍 <b>Информация о тренировках:</b>\n"
                        f"• Занятия проходят по <b>вторникам с 18:30 до 19:30</b>\n"
                        f"• Для первой тренировки необходимо иметь с собой <b>паспорт РФ</b>\n"
-                       f"🏀 Рады видеть тебя в команде! Задавай вопросы — коллеги с радостью помогут.\n"
-                       f"🎁 <b>Важно:</b> открой личный чат со мной и нажми /start — тогда я смогу поздравлять тебя с днём рождения!")
+                       f"🏀 Рады видеть тебя в команде! Задавай вопросы — коллеги с радостью помогут.")
         await context.bot.send_message(chat_id=update.effective_chat.id, text=welcome_text, parse_mode=ParseMode.HTML)
         
         db_manager = context.application.bot_data.get('db_manager')
         if db_manager:
             await db_manager.ensure_user_exists(user_id=user.id, username=user.username or '', full_name=full_name)
         
+        # ✅ Инструкции по ДР — только в личные сообщения
         private_text = (f"Привет, {full_name}! 👋\n"
                        f"Чтобы я мог автоматически поздравлять тебя с днём рождения, отправь мне команду:\n"
                        f"<b>/setbirthday ДД-ММ</b>\n"
                        f"📝 Пример: /setbirthday 15-03")
         try:
             await context.bot.send_message(chat_id=user.id, text=private_text, parse_mode=ParseMode.HTML)
-            logger.info(f"Отправлено личное приглашение указать ДР пользователю {user.id}")
+            logger.debug(f"Отправлено личное приглашение указать ДР пользователю {user.id}")
         except Forbidden:
             # ✅ ИСПРАВЛЕНО: убрано сообщение в общий чат, только логирование
-            logger.info(f"Пользователь {user.id} не начал диалог с ботом — приглашение пропущено")
+            logger.debug(f"Пользователь {user.id} не начал диалог с ботом — приглашение пропущено")
         
         logger.info(f"Приветствовали нового участника: {full_name}")
     except Exception as e:
